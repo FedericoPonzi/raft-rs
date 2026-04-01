@@ -1,0 +1,8 @@
+# Downloaded dependencies
+lib/
+
+# Generated traces and TLC artifacts
+traces/
+states/
+*.bin
+*_TTrace_*.tla
