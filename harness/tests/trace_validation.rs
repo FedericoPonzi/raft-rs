@@ -117,17 +117,33 @@ fn capture_message(msg: &Message) -> JsonValue {
         .map(|e| json!({"term": e.term, "value": format!("v{}", e.index)}))
         .collect();
 
-    json!({
-        "mtype": mtype,
-        "mterm": msg.term,
-        "msource": msg.from,
-        "mdest": msg.to,
-        "mlogTerm": msg.log_term,
-        "mindex": msg.index,
-        "mentries": entries,
-        "mcommitIndex": msg.commit,
-        "mreject": msg.reject,
-    })
+    match mtype {
+        "RequestVoteRequest" => json!({
+            "mtype": mtype, "mterm": msg.term,
+            "mlastLogTerm": msg.log_term, "mlastLogIndex": msg.index,
+            "msource": msg.from, "mdest": msg.to,
+        }),
+        "RequestVoteResponse" => json!({
+            "mtype": mtype, "mterm": msg.term,
+            "mvoteGranted": !msg.reject,
+            "msource": msg.from, "mdest": msg.to,
+        }),
+        "AppendEntriesRequest" => json!({
+            "mtype": mtype, "mterm": msg.term,
+            "mprevLogIndex": msg.index, "mprevLogTerm": msg.log_term,
+            "mentries": entries, "mcommitIndex": msg.commit,
+            "msource": msg.from, "mdest": msg.to,
+        }),
+        "AppendEntriesResponse" => json!({
+            "mtype": mtype, "mterm": msg.term,
+            "msuccess": !msg.reject, "mmatchIndex": msg.index,
+            "msource": msg.from, "mdest": msg.to,
+        }),
+        _ => json!({
+            "mtype": mtype, "mterm": msg.term,
+            "msource": msg.from, "mdest": msg.to,
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +201,53 @@ impl TracingNetwork {
         self.step += 1;
     }
 
+    /// Emit AppendEntries events decomposed to at most 1 entry each,
+    /// matching raft.tla's step granularity.
+    fn emit_ae_decomposed(
+        &mut self,
+        action: &str,
+        msg: &Message,
+        cluster_state: &JsonValue,
+    ) {
+        let n_entries = msg.entries.len();
+        if n_entries <= 1 {
+            self.emit(action, msg.from, Some(msg.to), Some(msg), cluster_state);
+            return;
+        }
+        // Decompose: emit one event per entry with incrementing prevLogIndex.
+        let base_prev = msg.index; // mprevLogIndex for the first entry
+        for k in 0..n_entries {
+            let entry = &msg.entries[k];
+            let prev_idx = base_prev + k as u64;
+            let prev_term = if k == 0 {
+                msg.log_term
+            } else {
+                msg.entries[k - 1].term
+            };
+            let single_msg = json!({
+                "mtype": "AppendEntriesRequest",
+                "mterm": msg.term,
+                "mprevLogIndex": prev_idx,
+                "mprevLogTerm": prev_term,
+                "mentries": [{"term": entry.term, "value": format!("v{}", entry.index)}],
+                "mcommitIndex": msg.commit,
+                "msource": msg.from,
+                "mdest": msg.to,
+            });
+            let mut line = json!({
+                "tag": "raft_trace",
+                "step": self.step,
+                "action": action,
+                "node": msg.from,
+                "target": msg.to,
+                "state": cluster_state,
+                "message": single_msg,
+            });
+            writeln!(self.trace_file, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+            self.step += 1;
+        }
+    }
+
     fn timeout(&mut self, id: u64) {
         let state = capture_cluster_state(&self.network, &self.servers);
         self.emit("Timeout", id, None, None, &state);
@@ -198,13 +261,13 @@ impl TracingNetwork {
         peer.persist();
         let msgs: Vec<Message> = peer.read_messages();
 
-        for m in &msgs {
+        for m in self.network.filter(msgs.iter().cloned()) {
             if matches!(
                 m.get_msg_type(),
                 MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
             ) {
                 let state = capture_cluster_state(&self.network, &self.servers);
-                self.emit("RequestVote", m.from, Some(m.to), Some(m), &state);
+                self.emit("RequestVote", m.from, Some(m.to), Some(&m), &state);
             }
         }
         self.deliver_messages(msgs);
@@ -249,7 +312,42 @@ impl TracingNetwork {
                 };
 
                 let state = capture_cluster_state(&self.network, &self.servers);
-                self.emit(action, m.to, Some(m.from), Some(&m), &state);
+                if action == "HandleAppendEntriesRequest" && m.entries.len() > 1 {
+                    // Decompose multi-entry AE receive into individual single-entry events.
+                    let base_prev = m.index;
+                    for k in 0..m.entries.len() {
+                        let entry = &m.entries[k];
+                        let prev_idx = base_prev + k as u64;
+                        let prev_term = if k == 0 {
+                            m.log_term
+                        } else {
+                            m.entries[k - 1].term
+                        };
+                        let single_msg = json!({
+                            "mtype": "AppendEntriesRequest",
+                            "mterm": m.term,
+                            "mprevLogIndex": prev_idx,
+                            "mprevLogTerm": prev_term,
+                            "mentries": [{"term": entry.term, "value": format!("v{}", entry.index)}],
+                            "mcommitIndex": m.commit,
+                            "msource": m.from,
+                            "mdest": m.to,
+                        });
+                        let mut line = json!({
+                            "tag": "raft_trace",
+                            "step": self.step,
+                            "action": action,
+                            "node": m.to,
+                            "target": m.from,
+                            "state": &state,
+                            "message": single_msg,
+                        });
+                        writeln!(self.trace_file, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+                        self.step += 1;
+                    }
+                } else {
+                    self.emit(action, m.to, Some(m.from), Some(&m), &state);
+                }
 
                 if action == "HandleRequestVoteResponse" {
                     let is_leader = self
@@ -264,34 +362,49 @@ impl TracingNetwork {
                     }
                 }
 
-                for rm in &resp {
-                    let send_action = match rm.get_msg_type() {
+                let filtered_resp = self.network.filter(resp);
+
+                for rm in &filtered_resp {
+                    match rm.get_msg_type() {
                         MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
-                            "RequestVote"
+                            let state = capture_cluster_state(&self.network, &self.servers);
+                            self.emit("RequestVote", rm.from, Some(rm.to), Some(rm), &state);
                         }
-                        MessageType::MsgAppend | MessageType::MsgHeartbeat => "AppendEntries",
-                        _ => continue,
+                        MessageType::MsgAppend | MessageType::MsgHeartbeat => {
+                            let state = capture_cluster_state(&self.network, &self.servers);
+                            self.emit_ae_decomposed("AppendEntries", rm, &state);
+                        }
+                        _ => {}
                     };
-                    let state = capture_cluster_state(&self.network, &self.servers);
-                    self.emit(send_action, rm.from, Some(rm.to), Some(rm), &state);
                 }
 
-                new_msgs.append(&mut self.network.filter(resp));
+                new_msgs.extend(filtered_resp);
             }
             pending.append(&mut new_msgs);
         }
     }
 
     fn client_request(&mut self, leader_id: u64) {
+        let value = format!("v{}", self.step);
+
         let state = capture_cluster_state(&self.network, &self.servers);
-        self.emit("ClientRequest", leader_id, None, None, &state);
+        let mut line = json!({
+            "tag": "raft_trace",
+            "step": self.step,
+            "action": "ClientRequest",
+            "node": leader_id,
+            "state": state,
+            "value": &value,
+        });
+        writeln!(self.trace_file, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+        self.step += 1;
 
         let mut msg = Message::default();
         msg.set_msg_type(MessageType::MsgPropose);
         msg.from = leader_id;
         msg.to = leader_id;
         let mut entry = Entry::default();
-        entry.data = format!("data_{}", self.step).into_bytes().into();
+        entry.data = value.into_bytes().into();
         msg.entries = vec![entry].into();
 
         let peer = self.network.peers.get_mut(&leader_id).unwrap();
@@ -308,13 +421,14 @@ impl TracingNetwork {
             .unwrap()
             .read_messages();
 
-        for m in &msgs {
+        // Only emit AE sends for messages that will actually be delivered.
+        for m in self.network.filter(msgs.iter().cloned()) {
             if matches!(
                 m.get_msg_type(),
                 MessageType::MsgAppend | MessageType::MsgHeartbeat
             ) {
                 let state = capture_cluster_state(&self.network, &self.servers);
-                self.emit("AppendEntries", m.from, Some(m.to), Some(m), &state);
+                self.emit_ae_decomposed("AppendEntries", &m, &state);
             }
         }
         self.deliver_messages(msgs);

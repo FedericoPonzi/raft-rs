@@ -140,7 +140,7 @@ Max(s) == CHOOSE x \in s : \A y \in s : x >= y
 InitHistoryVars == /\ elections = {}
                    /\ allLogs   = {}
                    /\ voterLog  = [i \in Server |-> [j \in {} |-> <<>>]]
-InitServerVars == /\ currentTerm = [i \in Server |-> 1]
+InitServerVars == /\ currentTerm = [i \in Server |-> 0]
                   /\ state       = [i \in Server |-> Follower]
                   /\ votedFor    = [i \in Server |-> Nil]
 InitCandidateVars == /\ votesResponded = [i \in Server |-> {}]
